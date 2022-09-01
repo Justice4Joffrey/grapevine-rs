@@ -1,0 +1,46 @@
+syntax = "proto2";
+
+package tree_state;
+
+/// A self contained piece of state holding multiple dummy values.
+message Leaf {
+  required int32 id = 1;
+  required int32 a = 2;
+  required int32 b = 3;
+}
+
+/// Edit a leaf's value by id.
+message EditLeaf {
+  required int32 id = 1;
+  required int32 value = 2;
+}
+
+/// Edit a leaf's 'a' value.
+message EditA {
+  required EditLeaf leaf = 1;
+}
+
+/// Edit a leaf's 'b' value.
+message EditB {
+  required EditLeaf leaf = 1;
+}
+
+/// Delete a leaf by id.
+message DeleteLeaf {
+  required int32 id = 1;
+}
+
+/// Create a new leaf.
+message NewLeaf {
+  required Leaf leaf = 1;
+}
+
+/// All messages to change the state of the tree.
+message LeafDelta {
+  oneof delta {
+    EditA editA = 1;
+    EditB editB = 2;
+    DeleteLeaf deleteLeaf = 3;
+    NewLeaf newLeaf = 4;
+  }
+}

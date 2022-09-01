@@ -1,0 +1,19 @@
+syntax = "proto2";
+
+import public "grapevine.proto";
+
+package recovery;
+
+/// Request for an individual StreamRawMessage.
+message SequenceRequest {
+  /// The sequence requested.
+  required int64 sequenceId = 1;
+}
+
+/// Allows clients to recover individual messages which they are missing.
+service RecoveryApi {
+  /// Get a StreamRawMessage by its sequenceId.
+  rpc GetMessage(SequenceRequest) returns (grapevine.RawMessage) {}
+  /// Subscribe to all StreamRawMessages after a particular sequence, until the latest.
+  rpc StreamFrom(SequenceRequest) returns (stream grapevine.RawMessage) {}
+}

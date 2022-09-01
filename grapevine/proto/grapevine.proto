@@ -1,0 +1,35 @@
+syntax = "proto2";
+
+package grapevine;
+
+/// The publisher has checked in.
+message Heartbeat {}
+/// The publisher has started publishing.
+message Started {}
+/// An incremental update of custom state.
+message Delta {
+  /// The custom delta as bytes
+  required bytes body = 1;
+}
+
+
+/// Metadata for the message payload.
+message Metadata {
+  /// The creation timestamp of this in nano-seconds.
+  required int64 timestamp = 1;
+  /// A unique monotonically-increasing sequence ID for this message.
+  required int64 sequence = 2;
+}
+
+
+/// A self contained message which must be sent as a single frame (i.e. no snapshots, over UDP).
+message RawMessage {
+  /// The header of the message.
+  required Metadata metadata = 1;
+  /// The payload. Signals what type of message this is and provides custom data.
+  oneof payload {
+    Heartbeat heartbeat = 2;
+    Started started = 3;
+    Delta delta = 4;
+  }
+}
