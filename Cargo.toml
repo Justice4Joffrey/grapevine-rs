@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "examples",
+    "grapevine",
+    "grapevine-tests",
+]

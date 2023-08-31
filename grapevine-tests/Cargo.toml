@@ -1,0 +1,15 @@
+[package]
+name = "grapevine-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures-util = "0.3"
+grapevine = { path = "../grapevine", features = ["sqlite"] }
+prost = "0.11"
+rand = "0.8"
+sqlx = { version = "0.6", features = ["migrate", "sqlite", "runtime-tokio-native-tls"] }
+tokio = { version = "1.19", features = ["sync", "time", "net", "rt-multi-thread", "macros"] }

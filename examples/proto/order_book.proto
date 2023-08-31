@@ -1,0 +1,21 @@
+syntax = "proto2";
+
+package order_book;
+
+enum QuoteAction {
+  INSERT = 1;
+  REMOVE = 2;
+}
+
+enum Side {
+  BUY = 1;
+  SELL = 2;
+}
+
+message QuoteDelta {
+  required QuoteAction action = 1;
+  required uint32 price = 2;
+  required uint32 quantity = 3;
+  required int64 timestamp = 4;
+  required Side side = 5;
+}
