@@ -6,6 +6,7 @@ use std::{
 
 use ::grapevine::*;
 use examples::order_book::Level1OrderBook;
+use futures::pin_mut;
 use grapevine::{
     proto::recovery::recovery_api_client::RecoveryApiClient, sqlite::SqliteSubscriberPersistence,
     transport::new_multicast_socket,
@@ -15,6 +16,7 @@ use sqlx::{
     SqlitePool,
 };
 use tokio_stream::StreamExt;
+use tokio_util::udp::UdpFramed;
 use tonic::transport::Channel;
 use tracing::info;
 
@@ -23,7 +25,7 @@ async fn main() {
     tracing_subscriber::fmt::init();
 
     // TODO: this is aligned to publisher. don't do that
-    let recovery_addr = "http://127.0.0.1:7755".parse().unwrap();
+    let recovery_addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 7755).to_string();
     // the pre-configured multicast address
     let mc_addr = SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 123), 1234);
 
@@ -49,24 +51,20 @@ async fn main() {
 
     let persistence = SqliteSubscriberPersistence::new(pool);
 
-    let channel = Channel::builder(recovery_addr).connect_lazy();
-    // TODO: create a subscriber
-    // let subscriber = SubscriberStream::<Level1OrderBook, _>::new(
-    //     Default::default(),
-    //     std::time::Duration::from_secs(5),
-    //     std::time::Duration::from_millis(20),
-    //     5,
-    //     Arc::new(socket),
-    //     persistence,
-    //     RecoveryApiClient::new(channel),
-    // );
-    //
-    // let mut stream = subscriber.stream();
-    //
-    // while let Some(Some(Ok((state, _, sequence)))) = stream.next().await {
-    //     if sequence % 10000 == 0 {
-    //         let lock = state.read().await;
-    //         info!("Sequence {} Order book: {}", sequence, lock.state());
-    //     }
-    // }
+    let channel = Channel::builder(recovery_addr.parse().unwrap()).connect_lazy();
+
+    let mut sequencer = MessageSequencer::<Level1OrderBook>::new(
+        Arc::new(socket),
+        RecoveryApiClient::new(channel),
+        3,
+        0,
+        std::time::Duration::from_secs(5),
+    );
+    let stream = sequencer.into_stream();
+    pin_mut!(stream);
+
+    while let Some(message) = stream.next().await {
+        let message = message.unwrap();
+        info!("Message: {:?}", message);
+    }
 }

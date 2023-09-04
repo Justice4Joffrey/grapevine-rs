@@ -4,6 +4,17 @@
 
 A minimalistic, simple, multicast networking paradigm for distributed systems.
 
+## WARNING:  Not at all complete: work in progres
+Examples:
+
+```
+# run the subscriber:
+cargo run --example order_book_subscriber
+
+# separately, whilst the subscriber is running:
+cargo run --example order_book_publisher
+```
+
 <!-- TOC -->
 
 * [Grapevine](#grapevine)

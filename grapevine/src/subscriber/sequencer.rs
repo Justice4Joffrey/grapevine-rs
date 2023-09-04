@@ -1,24 +1,32 @@
-use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc, time::Duration};
+use std::{cmp::Reverse, collections::BinaryHeap, marker::PhantomData, sync::Arc, time::Duration};
 
-use futures::stream::StreamExt;
+use async_stream::stream;
+use futures::{stream::StreamExt, Stream};
 use pin_project::pin_project;
+use prost::Message;
 use tokio::{
     net::UdpSocket,
     time::{timeout, Instant},
 };
 use tokio_util::udp::UdpFramed;
 use tonic::{transport::Channel, Request};
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
-use crate::proto::{
-    grapevine::RawMessage,
-    recovery::{recovery_api_client::RecoveryApiClient, SequenceRequest},
+use crate::{
+    proto::{
+        grapevine::{raw_message::Payload, RawMessage},
+        recovery::{recovery_api_client::RecoveryApiClient, SequenceRequest},
+    },
+    StateSync,
 };
 
 /// Takes a stream of potentially out of order messages and returns a stream
 /// of in order messages.
+///
+/// Depending on the configuration parameters passed, the sequencer will use
+/// its TCP client to attempt to recover missing messages.
 #[pin_project]
-pub struct MessageSequencer {
+pub struct MessageSequencer<S> {
     /// Client to request missing messages from the publisher.
     recovery_client: RecoveryApiClient<Channel>,
     #[pin]
@@ -34,20 +42,29 @@ pub struct MessageSequencer {
     want_sequence: i64,
     /// The deadline at which we
     last_deadline: Instant,
-    /// Whether we are currently disconnected. TODO: should be "connected"?
-    disconnected: bool,
+    /// Whether we are currently connected.
+    connected: bool,
+    /// Bind a sequencer to a specific message type.
+    phantom: PhantomData<S>,
 }
 
+#[derive(Debug)]
+pub enum SubscriberStreamMessage<T> {
+    Delta(T),
+    Started,
+    Heartbeat,
+}
+
+#[derive(Debug)]
 pub enum SubscriberStream<T> {
-    InSync(T),
-    Syncing(T),
+    Message(SubscriberStreamMessage<T>),
     RequestSync,
     Disconnected,
 }
 
-impl MessageSequencer {
+impl<S: StateSync> MessageSequencer<S> {
     pub fn new(
-        udp_framed: UdpFramed<crate::codec::Decoder<RawMessage>, Arc<UdpSocket>>,
+        socket: Arc<UdpSocket>,
         recovery_client: RecoveryApiClient<Channel>,
         max_missing_messages: i64,
         want_sequence: i64,
@@ -55,19 +72,45 @@ impl MessageSequencer {
     ) -> Self {
         Self {
             recovery_client,
-            udp_framed,
+            udp_framed: UdpFramed::new(socket, crate::codec::Decoder::<RawMessage>::new()),
             heap: BinaryHeap::new(),
             max_missing_messages,
             sequence_timeout,
             want_sequence,
             last_deadline: Instant::now(),
-            disconnected: true,
+            connected: false,
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn into_stream(
+        mut self,
+    ) -> impl Stream<Item = Result<SubscriberStream<S::Delta>, Box<dyn std::error::Error + Send + Sync>>>
+    {
+        let stream = stream! {
+            loop {
+                yield self.next().await;
+            }
+        };
+        stream
+    }
+
+    fn try_parse(
+        message: &RawMessage,
+    ) -> Result<SubscriberStreamMessage<S::Delta>, Box<dyn std::error::Error + Send + Sync>> {
+        match message.payload.as_ref().ok_or("Missing payload")? {
+            Payload::Heartbeat(_) => Ok(SubscriberStreamMessage::Heartbeat),
+            Payload::Started(_) => Ok(SubscriberStreamMessage::Started),
+            Payload::Delta(delta) => {
+                let delta = S::Delta::decode(delta.body.as_ref())?;
+                Ok(SubscriberStreamMessage::Delta(delta))
+            }
         }
     }
 
     async fn next(
         &mut self,
-    ) -> Result<SubscriberStream<RawMessage>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<SubscriberStream<S::Delta>, Box<dyn std::error::Error + Send + Sync>> {
         // First check whether the heap has the next message.
         while let Some(Reverse(msg)) = self.heap.peek() {
             if msg.metadata.sequence == self.want_sequence {
@@ -75,7 +118,7 @@ impl MessageSequencer {
                 let msg = self.heap.pop().unwrap().0;
                 self.want_sequence += 1;
                 self.last_deadline = Instant::now() + self.sequence_timeout;
-                return Ok(SubscriberStream::InSync(msg));
+                return Ok(SubscriberStream::Message(Self::try_parse(&msg)?));
             } else if msg.metadata.sequence < self.want_sequence {
                 // unwrap: we just peeked
                 self.heap.pop().unwrap();
@@ -85,7 +128,7 @@ impl MessageSequencer {
             }
         }
 
-        if self.disconnected {
+        if !self.connected {
             self.last_deadline = Instant::now() + self.sequence_timeout;
         }
 
@@ -101,6 +144,7 @@ impl MessageSequencer {
                     let missing = next_msg.0.metadata.sequence - self.want_sequence;
                     if missing > self.max_missing_messages {
                         // restream from want_sequence
+                        debug!("Requesting sync from {}", self.want_sequence);
                         return match self
                             .recovery_client
                             .stream_from(Request::new(SequenceRequest {
@@ -118,11 +162,12 @@ impl MessageSequencer {
                                     trace!("Pushing {} to heap from stream", msg.metadata.sequence);
                                     self.heap.push(Reverse(msg));
                                 }
-                                Ok(SubscriberStream::Syncing(msg))
+                                Ok(SubscriberStream::Message(Self::try_parse(&msg)?))
                             }
                             Err(err) => Err(Box::new(err)),
                         };
                     } else if missing <= 1 {
+                        debug!("Requesting message {}", self.want_sequence);
                         let msg = self
                             .recovery_client
                             .get_message(SequenceRequest {
@@ -131,14 +176,18 @@ impl MessageSequencer {
                             .await?;
                         self.want_sequence += 1;
                         self.last_deadline = now + self.sequence_timeout;
-                        return Ok(SubscriberStream::Syncing(msg.into_inner()));
+                        return Ok(SubscriberStream::Message(Self::try_parse(
+                            &msg.into_inner(),
+                        )?));
                     } else {
                         // recover multiple
+                        // TODO: log messages
+                        debug!("Requesting messages");
                         todo!()
                     };
                 } else {
                     // the socket has stopped receiving messages
-                    self.disconnected = true;
+                    self.connected = false;
                     // TODO: should be an error?
                     return Ok(SubscriberStream::Disconnected);
                 }
@@ -147,13 +196,13 @@ impl MessageSequencer {
             let duration = self.last_deadline.duration_since(now);
             match timeout(duration, self.udp_framed.next()).await {
                 Ok(Some(Ok((msg, _)))) => {
-                    self.disconnected = false;
+                    self.connected = true;
                     if msg.metadata.sequence < self.want_sequence {
                         continue;
                     } else if msg.metadata.sequence == self.want_sequence {
                         self.want_sequence += 1;
                         self.last_deadline = now + self.sequence_timeout;
-                        return Ok(SubscriberStream::InSync(msg));
+                        return Ok(SubscriberStream::Message(Self::try_parse(&msg)?));
                     } else {
                         self.heap.push(Reverse(msg));
                         continue;

@@ -16,6 +16,7 @@ path = "order_book_publisher.rs"
 arbitrary = { version = "1", features = ["derive"] }
 bytes = "1"
 chrono = "0.4"
+futures = "0.3"
 grapevine = { path = "../grapevine", default-features = false, features = ["sqlite"] }
 prost = "0.11"
 random = "0.12"

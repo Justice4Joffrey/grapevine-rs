@@ -1,6 +1,6 @@
 use std::error::Error;
-use thiserror::Error;
 
+use thiserror::Error;
 use tonic::Status;
 
 #[derive(Debug, Error)]
