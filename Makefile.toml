@@ -1,0 +1,8 @@
+[config]
+default_to_workspace = false
+
+[env]
+
+[tasks.test-sequencer]
+command = "cargo"
+args = ["test", "-F", "mocks", "subscriber::sequencer", "--", "--nocapture"]
