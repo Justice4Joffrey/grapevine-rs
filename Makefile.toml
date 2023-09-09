@@ -4,5 +4,6 @@ default_to_workspace = false
 [env]
 
 [tasks.test-sequencer]
+# env = { "RUST_LOG" = "grapevine=trace" }
 command = "cargo"
 args = ["test", "-F", "mocks", "subscriber::sequencer", "--", "--nocapture"]

@@ -476,8 +476,6 @@ mod tests {
     /// tries to break MinMaxHeap::has_gaps() { max - min + 1 - len != 0 }
     #[tokio::test]
     async fn batch_recovery_with_duplicates() -> anyhow::Result<()> {
-        tracing_subscriber::fmt::init();
-
         let target: Vec<_> = (0..100).collect();
 
         let missing = vec![70, 72, 74, 76, 78];
