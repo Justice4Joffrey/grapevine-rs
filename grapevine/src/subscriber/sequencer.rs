@@ -134,6 +134,10 @@ impl<S: StateSync> MessageSequencer<S> {
         loop {
             let now = Instant::now();
             if now > self.last_deadline {
+                // TODO: this could be a little smarter e.g. take a heap
+                //  and want_sequence and tell you the diff of sync time and
+                //  the number of missing messages
+                // Time to request sync or individual messages
                 if let Some(next_msg) = self.heap.peek() {
                     // gRPC guarantee order of messages inside stream (https://grpc.io/docs/what-is-grpc/core-concepts/)
                     // correctness of messages from gRPC is not checked
