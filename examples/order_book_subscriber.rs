@@ -56,7 +56,6 @@ async fn main() {
     let mut sequencer = MessageSequencer::<Level1OrderBook>::new(
         Arc::new(socket),
         RecoveryApiClient::new(channel),
-        3,
         0,
         std::time::Duration::from_secs(5),
     );
