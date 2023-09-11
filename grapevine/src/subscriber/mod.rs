@@ -1,3 +1,4 @@
+mod message;
 mod sequencer;
 mod min_max_heap;
 
