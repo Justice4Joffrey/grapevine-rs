@@ -1,4 +1,4 @@
-use std::{cmp::Reverse, collections::BinaryHeap, marker::PhantomData, sync::Arc, time::Duration};
+use std::{cmp::Reverse, marker::PhantomData, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use futures::{stream::StreamExt, Stream};
@@ -20,6 +20,8 @@ use crate::{
     StateSync,
 };
 
+use super::min_max_heap::MinMaxHeap;
+
 /// Takes a stream of potentially out of order messages and returns a stream
 /// of in order messages.
 ///
@@ -33,12 +35,9 @@ pub struct MessageSequencer<S> {
     udp_framed: UdpFramed<crate::codec::Decoder<RawMessage>, Arc<UdpSocket>>,
     /// Buffer of messages that are received with a higher sequence than
     /// `want_sequence`.
-    heap: BinaryHeap<Reverse<RawMessage>>,
+    heap: MinMaxHeap,
     /// How long to wait for a message before requesting a sync.
     sequence_timeout: Duration,
-    /// How many messages can be missing before requesting a full resync from earliest missing message to last
-    /// This option affects method of syncing but only after `sequence_timeout` elapsed
-    batch_resync_threshold: i64,
     /// The sequence number of the next message we want.
     want_sequence: i64,
     /// The deadline at which we
@@ -67,15 +66,13 @@ impl<S: StateSync> MessageSequencer<S> {
     pub fn new(
         socket: Arc<UdpSocket>,
         recovery_client: RecoveryApiClient<Channel>,
-        batch_resync_threshold: i64,
         want_sequence: i64,
         sequence_timeout: Duration,
     ) -> Self {
         Self {
             recovery_client,
             udp_framed: UdpFramed::new(socket, crate::codec::Decoder::<RawMessage>::new()),
-            heap: BinaryHeap::new(),
-            batch_resync_threshold,
+            heap: MinMaxHeap::new(),
             sequence_timeout,
             want_sequence,
             last_deadline: Instant::now(),
@@ -142,15 +139,29 @@ impl<S: StateSync> MessageSequencer<S> {
                 //  the number of missing messages
                 // Time to request sync or individual messages
                 if let Some(next_msg) = self.heap.peek() {
-                    // TODO: missing = (heap.max - heap.min) - len(heap)
-                    let missing = next_msg.0.metadata.sequence - self.want_sequence;
-                    if missing > self.batch_resync_threshold {
+                    // gRPC guarantee order of messages inside stream (https://grpc.io/docs/what-is-grpc/core-concepts/)
+                    // correctness of messages from gRPC is not checked
+                    // they should be sorted and started exactly from `want_sequence`
+
+                    let single_missing = self.want_sequence + 1 == next_msg.0.metadata.sequence &&
+                        !self.heap.has_gaps();
+
+                    if single_missing {
+                        debug!("Requesting message {}", self.want_sequence);
+                        let msg = self
+                            .recovery_client
+                            .get_message(SequenceRequest {
+                                sequence_id: self.want_sequence,
+                            })
+                            .await?;
+                        self.want_sequence += 1;
+                        self.last_deadline = now + self.sequence_timeout;
+                        return Ok(SubscriberStream::Message(Self::try_parse(
+                            &msg.into_inner(),
+                        )?));
+                    } else {
                         // restream from want_sequence
                         debug!("Requesting sync from {}", self.want_sequence);
-
-                        // gRPC guarantee order of messages inside stream (https://grpc.io/docs/what-is-grpc/core-concepts/)
-                        // correctness of messages from gRPC was not checked
-                        // they should be sorted and start exactly from `want_sequence`
 
                         return match self
                             .recovery_client
@@ -173,25 +184,7 @@ impl<S: StateSync> MessageSequencer<S> {
                             }
                             Err(err) => Err(Box::new(err)),
                         };
-                    } else if missing <= 1 {
-                        debug!("Requesting message {}", self.want_sequence);
-                        let msg = self
-                            .recovery_client
-                            .get_message(SequenceRequest {
-                                sequence_id: self.want_sequence,
-                            })
-                            .await?;
-                        self.want_sequence += 1;
-                        self.last_deadline = now + self.sequence_timeout;
-                        return Ok(SubscriberStream::Message(Self::try_parse(
-                            &msg.into_inner(),
-                        )?));
-                    } else {
-                        // recover multiple
-                        // TODO: log messages
-                        debug!("Requesting messages");
-                        todo!()
-                    };
+                    }
                 } else {
                     // the socket has stopped receiving messages
                     self.connected = false;
@@ -235,12 +228,12 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_util::codec::Encoder;
-    use tonic::{Response, Status, transport::Server};
+    use tonic::{Response, Status, transport::{Server, Uri}};
     use rand::seq::SliceRandom;
     use rand::thread_rng;
 
     use super::*;
-    use crate::{StateSync, proto::{recovery::recovery_api_server::{RecoveryApiServer, RecoveryApi}, grapevine::{Metadata, Delta}}, publisher::MessageStream};
+    use crate::{StateSync, proto::{recovery::recovery_api_server::{RecoveryApiServer, RecoveryApi}, grapevine::Delta}, publisher::MessageStream};
 
     #[derive(Default)]
     struct TestStateSync {}
@@ -249,14 +242,14 @@ mod tests {
         type ApplyError = Infallible;
         type Delta = i64;
 
-        fn apply_delta(&mut self, delta: Self::Delta) -> Result<(), Self::ApplyError> {
+        fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), Self::ApplyError> {
             Ok(())
         }
     }
 
     struct TestRecoveryApi {
         count: i64,
-        sent: Mutex<i64>,
+        sent: Arc<Mutex<i64>>,
     }
 
     #[tonic::async_trait]
@@ -269,7 +262,8 @@ mod tests {
         ) -> Result<Response<RawMessage>, Status> {
             let inner = request.into_inner();
             *self.sent.lock().unwrap() += 1;
-            Ok(Response::new(RawMessage { metadata: Metadata { timestamp: 0, sequence: inner.sequence_id }, payload: None }))
+            let msg = make_raw_msg(inner.sequence_id).map_err(|_| Status::internal("cannot make msg"))?;
+            Ok(Response::new(msg))
         }
 
         async fn stream_from(
@@ -283,7 +277,8 @@ mod tests {
 
                 stream! {
                     for id in ids {
-                        yield Result::Ok(RawMessage { metadata: Metadata { timestamp: 0, sequence: id }, payload: None });
+                        let msg = make_raw_msg(id).map_err(|_| Status::internal("cannot make msg"))?;
+                        yield Result::Ok(msg);
                     }
                 }
             };
@@ -321,12 +316,13 @@ mod tests {
         Ok(buffer.freeze())
     }
 
-    async fn make_recovery_server(total_len: i64) -> anyhow::Result<std::net::SocketAddr> {
+    async fn make_recovery_server(total_len: i64) -> anyhow::Result<(Uri, Arc<Mutex<i64>>)> {
         let bind_addr: SocketAddrV4 = "127.0.0.1:0".parse()?;
         let socket = TcpListener::bind(bind_addr).await?;
         let addr = socket.local_addr()?;
         let stream = TcpListenerStream::new(socket);
-        let api = TestRecoveryApi { count: total_len, sent: Mutex::new(0) };
+        let sent_counter = Arc::new(Mutex::new(0));
+        let api = TestRecoveryApi { count: total_len, sent: sent_counter.clone() };
 
         tokio::spawn(async move {
             Server::builder()
@@ -335,21 +331,31 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
 
-        Ok(addr)
+        let uri = format!("http://{}", addr.to_string()).parse::<Uri>()?;
+        Ok((uri, sent_counter))
     }
 
-    async fn test_it(source: Vec<i64>, target: Vec<i64>, want_sequence: i64) -> anyhow::Result<()> {
+    async fn test_it(
+        source: Vec<i64>,
+        target: Vec<i64>,
+        want_sequence: i64,
+        sequence_timeout: Duration,
+    ) -> anyhow::Result<Arc<Mutex<i64>>> {
         let subscriber = UdpSocket::bind("127.0.0.1:0").await?;
         let publisher = UdpSocket::bind("127.0.0.1:0").await?;
         publisher.connect(subscriber.local_addr()?).await?;
 
-        let recovery_addr = make_recovery_server(target.len() as i64).await?;
-
-        let recovery_client_channel = Channel::builder(recovery_addr.to_string().parse().unwrap()).connect_lazy();
+        let (recovery_uri, sent_by_recovery) = make_recovery_server(target.len() as i64).await?;
+        let recovery_client_channel = Channel::builder(recovery_uri).connect_lazy();
         let recovery_client = RecoveryApiClient::new(recovery_client_channel);
 
         let subscriber = Arc::new(subscriber);
-        let sequencer = MessageSequencer::<TestStateSync>::new(subscriber, recovery_client, i64::MAX, want_sequence, Duration::from_secs(60));
+        let sequencer = MessageSequencer::<TestStateSync>::new(
+            subscriber,
+            recovery_client,
+            want_sequence,
+            sequence_timeout,
+        );
         let result_stream = sequencer.into_stream();
         pin_mut!(result_stream);
 
@@ -363,7 +369,7 @@ mod tests {
         });
 
         let out: Result<Vec<_>, _> = result_stream.take(target.len()).try_collect().await;
-        let out = out.expect("stream error");
+        let out = out.map_err(|e| anyhow::anyhow!(e))?;
         let out = out.into_iter()
             .map(|v| get_id(v))
             .collect::<Option<Vec<_>>>()
@@ -372,7 +378,7 @@ mod tests {
 
         assert_eq!(target, out);
 
-        Ok(())
+        Ok(sent_by_recovery)
     }
 
     #[tokio::test]
@@ -381,7 +387,8 @@ mod tests {
         let source: Vec<_> = (0..count).collect();
         let target: Vec<_> = (0..count).collect();
 
-        test_it(source, target, 0).await?;
+        let sent_by_recovery = test_it(source, target, 0, Duration::from_secs(60)).await?;
+        assert_eq!(*sent_by_recovery.lock().unwrap(), 0);
 
         Ok(())
     }
@@ -395,7 +402,8 @@ mod tests {
         let mut rng = thread_rng();
         source.shuffle(&mut rng);
 
-        test_it(source, target, 0).await?;
+        let sent_by_recovery = test_it(source, target, 0, Duration::from_secs(60)).await?;
+        assert_eq!(*sent_by_recovery.lock().unwrap(), 0);
 
         Ok(())
     }
@@ -409,8 +417,83 @@ mod tests {
         let mut rng = thread_rng();
         source.shuffle(&mut rng);
 
-        test_it(source, target, 10).await?;
+        let sent_by_recovery = test_it(source, target, 10, Duration::from_secs(60)).await?;
+        assert_eq!(*sent_by_recovery.lock().unwrap(), 0);
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn unordered_with_duplicates() -> anyhow::Result<()> {
+        let count = 100;
+        let target: Vec<_> = (0..count).collect();
+
+        let mut source: Vec<_> = target.iter().cloned().chain(target.iter().cloned()).collect();
+        let mut rng = thread_rng();
+        source.shuffle(&mut rng);
+
+        let sent_by_recovery = test_it(source, target, 0, Duration::from_secs(60)).await?;
+        assert_eq!(*sent_by_recovery.lock().unwrap(), 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn singe_recovery() -> anyhow::Result<()> {
+        let count = 100;
+        let target: Vec<_> = (0..count).collect();
+
+        let mut source: Vec<_> = (0..count).collect();
+        let mut rng = thread_rng();
+        source.shuffle(&mut rng);
+        source.pop();
+
+        let start_at = Instant::now();
+        let sent_by_recovery = test_it(source, target, 0, Duration::from_millis(250)).await?;
+
+        assert_eq!(*sent_by_recovery.lock().unwrap(), 1);
+        assert!(Instant::now() - start_at < Duration::from_millis(500));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batch_recovery() -> anyhow::Result<()> {
+        let target: Vec<_> = (0..100).collect();
+
+        let missing = vec![70, 72, 74, 76, 78];
+        let source: Vec<_> = target.iter().cloned().filter(|v| !missing.contains(v)).collect();
+
+        let start_at = Instant::now();
+        let sent_by_recovery = test_it(source, target, 0, Duration::from_millis(250)).await?;
+
+        assert_eq!(*sent_by_recovery.lock().unwrap(), 100 - 70); // [70; 100)
+        assert!(Instant::now() - start_at < Duration::from_millis(500));
+
+        Ok(())
+    }
+
+    /// tries to break MinMaxHeap::has_gaps() { max - min + 1 - len != 0 }
+    #[tokio::test]
+    async fn batch_recovery_with_duplicates() -> anyhow::Result<()> {
+        let target: Vec<_> = (0..100).collect();
+
+        let missing = vec![70, 72, 74, 76, 78];
+        let duplicates = vec![71, 73, 75, 77, 79];
+        let source: Vec<_> = target.iter().cloned()
+            .filter(|v| !missing.contains(v))
+            .chain(duplicates).collect();
+        assert_eq!(source.len(), target.len());
+
+        let start_at = Instant::now();
+        let sent_by_recovery = test_it(source, target, 0, Duration::from_millis(250)).await?;
+
+        assert!(Instant::now() - start_at < Duration::from_millis(500));
+        assert_eq!(*sent_by_recovery.lock().unwrap(), 100 - 70); // [70; 100)
+
+        Ok(())
+    }
+
+    // TODO: recovery_is_down
+    // TODO: check enum (udp timeout, ...)
 }
