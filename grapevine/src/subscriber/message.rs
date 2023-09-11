@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Utc, DateTime};
 
 use crate::proto::grapevine::RawMessage;
 
@@ -22,7 +22,7 @@ pub enum Origin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivedMessage {
     /// according to our process (in nano-seconds)
-    pub recv_ts: i64,
+    pub recv_ts: DateTime<Utc>,
     pub origin: Origin,
     pub raw: RawMessage,
 }
@@ -30,7 +30,7 @@ pub struct ReceivedMessage {
 impl ReceivedMessage {
     pub fn new(raw: RawMessage, origin: Origin) -> Self {
         ReceivedMessage {
-            recv_ts: Utc::now().timestamp_nanos(),
+            recv_ts: Utc::now(),
             origin,
             raw,
         }

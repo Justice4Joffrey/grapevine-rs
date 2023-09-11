@@ -1,6 +1,7 @@
 use std::{cmp::Reverse, marker::PhantomData, sync::Arc, time::Duration};
 
 use async_stream::stream;
+use chrono::{DateTime, Utc, NaiveDateTime};
 use futures::{stream::StreamExt, Stream};
 use pin_project::pin_project;
 use prost::{Message, DecodeError};
@@ -22,6 +23,16 @@ use crate::{
 };
 
 use super::{min_max_heap::MinMaxHeap, message::{SubscriberStreamMessage, Origin, ReceivedMessage}};
+
+fn ns_to_datetime(timestamp_ns: i64) -> DateTime<Utc> {
+    const NANO: i64 = 1_000_000_000;
+    let secs = timestamp_ns / NANO;
+    let ns = timestamp_ns % NANO;
+
+    // unwrap: input values are always in allowed range
+    let dt = NaiveDateTime::from_timestamp_opt(secs, ns as u32).unwrap();
+    DateTime::from_naive_utc_and_offset(dt, Utc)
+}
 
 /// Takes a stream of potentially out of order messages and returns a stream
 /// of in order messages.
@@ -52,10 +63,10 @@ pub struct MessageSequencer<S> {
 #[derive(Debug)]
 pub enum SubscriberStream<T> {
     Message {
-        /// according to sender (in nano-seconds)
-        send_ts: i64,
-        /// according to our process (in nano-seconds)
-        recv_ts: i64,
+        /// according to sender
+        send_ts: DateTime<Utc>,
+        /// according to our process
+        recv_ts: DateTime<Utc>,
         origin: Origin,
         msg: SubscriberStreamMessage<T>
     },
@@ -115,7 +126,7 @@ impl<S: StateSync> MessageSequencer<S> {
         let payload = payload?;
 
         Ok(SubscriberStream::Message {
-            send_ts: message_from.raw.metadata.timestamp,
+            send_ts: ns_to_datetime(message_from.raw.metadata.timestamp),
             recv_ts: message_from.recv_ts,
             origin: message_from.origin.clone(),
             msg: payload,

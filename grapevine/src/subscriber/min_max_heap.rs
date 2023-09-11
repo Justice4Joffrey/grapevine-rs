@@ -65,7 +65,8 @@ impl MinMaxHeap {
 
     fn count_missing(&self) -> i64 {
         if let Some(max_id) = self.max_id {
-            // unwrap: self.max_id is Some only if heap.len > 0
+            // unwrap: all methods should always maintain invariant
+            // self.max_id.is_none() == self.heap.is_empty() == self.counter.is_empty()
             let min_id = self.peek().unwrap().0.raw.metadata.sequence;
             let uniq = self.counter.len();
             max_id - min_id + 1 - (uniq as i64)
