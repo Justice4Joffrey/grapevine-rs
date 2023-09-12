@@ -10,7 +10,7 @@ use tokio::{
     time::{timeout, Instant},
 };
 use tokio_util::udp::UdpFramed;
-use tonic::{transport::Channel, Request};
+use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, trace, warn};
 use thiserror::Error;
 
@@ -48,6 +48,8 @@ pub struct MessageSequencer<S> {
     /// Buffer of messages that are received with a higher sequence than
     /// `want_sequence`.
     heap: MinMaxHeap,
+    /// Stream for batch recovery
+    recovery_stream: Option<Streaming<RawMessage>>,
     /// How long to wait for a message before requesting a sync.
     sequence_timeout: Duration,
     /// The sequence number of the next message we want.
@@ -92,6 +94,7 @@ impl<S: StateSync> MessageSequencer<S> {
             recovery_client,
             udp_framed: UdpFramed::new(socket, crate::codec::Decoder::<RawMessage>::new()),
             heap: MinMaxHeap::new(),
+            recovery_stream: None,
             sequence_timeout,
             want_sequence,
             last_deadline: Instant::now(),
@@ -136,6 +139,27 @@ impl<S: StateSync> MessageSequencer<S> {
     async fn next(
         &mut self,
     ) -> Result<SubscriberStream<S::Delta>, Box<dyn std::error::Error + Send + Sync>> {
+        // gRPC guarantee order of messages inside stream (https://grpc.io/docs/what-is-grpc/core-concepts/)
+        // recovery messages should be sent sorted
+        if let Some(recovery_stream) = self.recovery_stream.as_mut() {
+            if let Some(msg) = recovery_stream.next().await {
+                let msg = ReceivedMessage::new(msg?, Origin::Sync);
+                trace!("Message {} received from sync stream", msg.raw.metadata.sequence);
+
+                if msg.raw.metadata.sequence != self.want_sequence {
+                    return Err(Box::new(SubscriberStreamError::InvalidSequence));
+                }
+
+                self.want_sequence += 1;
+                self.last_deadline = Instant::now() + self.sequence_timeout;
+
+                return Ok(Self::try_parse(&msg)?);
+            } else {
+                debug!("Sync is done");
+                self.recovery_stream = None;
+            }
+        }
+
         // First check whether the heap has the next message.
         while let Some(Reverse(msg)) = self.heap.peek() {
             if msg.raw.metadata.sequence == self.want_sequence {
@@ -199,19 +223,10 @@ impl<S: StateSync> MessageSequencer<S> {
 
                         let mut stream = response.into_inner();
 
-                        // if don't clean heap then there will be duplicates
-                        // and origin (udp/sync) will be mixed
-                        // other solution is to implement Ord which compare tuples (seq_id, origin)
-                        self.heap.clear();
-
-                        while let Some(Ok(msg)) = stream.next().await {
-                            trace!("Pushing {} to heap from stream", msg.metadata.sequence);
-                            self.heap.push(Reverse(ReceivedMessage::new(msg, Origin::Sync)));
-                        }
-
-                        let msg = self.heap.pop()
-                            .ok_or(Box::new(SubscriberStreamError::EmptyStream))?
-                            .0;
+                        let msg = stream.next().await
+                            .ok_or(Box::new(SubscriberStreamError::EmptyStream))??;
+                        let msg = ReceivedMessage::new(msg, Origin::Sync);
+                        trace!("Message {} received from sync stream", msg.raw.metadata.sequence);
 
                         if msg.raw.metadata.sequence != self.want_sequence {
                             return Err(Box::new(SubscriberStreamError::InvalidSequence));
@@ -219,6 +234,7 @@ impl<S: StateSync> MessageSequencer<S> {
 
                         self.want_sequence += 1;
                         self.last_deadline = now + self.sequence_timeout;
+                        self.recovery_stream = Some(stream);
 
                         return Ok(Self::try_parse(&msg)?);
                     }
@@ -366,7 +382,7 @@ mod tests {
         let publisher = UdpSocket::bind("127.0.0.1:0").await?;
         publisher.connect(subscriber.local_addr()?).await?;
 
-        let (recovery_uri, sent_by_recovery) = make_recovery_server(target.len() as i64).await?;
+        let (recovery_uri, _) = make_recovery_server(target.len() as i64).await?;
         let recovery_client_channel = Channel::builder(recovery_uri).connect_lazy();
         let recovery_client = RecoveryApiClient::new(recovery_client_channel);
 
