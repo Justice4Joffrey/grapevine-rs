@@ -226,6 +226,7 @@ impl<S: StateSync> MessageSequencer<S> {
                         let msg = stream.next().await
                             .ok_or(Box::new(SubscriberStreamError::EmptyStream))??;
                         let msg = ReceivedMessage::new(msg, Origin::Sync);
+                        trace!("Message {} received from sync stream", msg.raw.metadata.sequence);
 
                         if msg.raw.metadata.sequence != self.want_sequence {
                             return Err(Box::new(SubscriberStreamError::InvalidSequence));
