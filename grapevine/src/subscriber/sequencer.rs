@@ -275,7 +275,7 @@ impl<S: StateSync> MessageSequencer<S> {
 
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::{convert::Infallible, net::SocketAddrV4, sync::Mutex};
     use futures::{pin_mut, TryStreamExt};
     use tokio::net::TcpListener;
@@ -287,13 +287,16 @@ mod tests {
     use crate::{StateSync, proto::recovery::recovery_api_server::{RecoveryApiServer, RecoveryApi}, publisher::MessageStream, subscriber::message::test_utils::{make_raw_msg, make_raw_msg_bytes}};
 
     #[derive(Default)]
-    struct TestStateSync {}
+    pub struct TestStateSync {
+        pub sum: i64,
+    }
 
     impl StateSync for TestStateSync {
-        type ApplyError = Infallible;
         type Delta = i64;
+        type ApplyError = Infallible;
 
         fn apply_delta(&mut self, _delta: Self::Delta) -> Result<(), Self::ApplyError> {
+            self.sum += 1;
             Ok(())
         }
     }
@@ -372,17 +375,20 @@ mod tests {
         Ok((uri, sent_counter))
     }
 
-    async fn test_it(
-        source: Vec<i64>,
-        target: Vec<(i64, Origin)>,
+    pub async fn make_default_sequencer() -> anyhow::Result<(MessageSequencer<TestStateSync>, UdpSocket)> {
+        make_sequencer(0, Duration::from_secs(5), 0).await
+    }
+
+    async fn make_sequencer(
         want_sequence: i64,
         sequence_timeout: Duration,
-    ) -> anyhow::Result<()> {
+        total_len: i64,
+    ) -> anyhow::Result<(MessageSequencer<TestStateSync>, UdpSocket)> {
         let subscriber = UdpSocket::bind("127.0.0.1:0").await?;
         let publisher = UdpSocket::bind("127.0.0.1:0").await?;
         publisher.connect(subscriber.local_addr()?).await?;
 
-        let (recovery_uri, _) = make_recovery_server(target.len() as i64).await?;
+        let (recovery_uri, _) = make_recovery_server(total_len).await?;
         let recovery_client_channel = Channel::builder(recovery_uri).connect_lazy();
         let recovery_client = RecoveryApiClient::new(recovery_client_channel);
 
@@ -393,6 +399,17 @@ mod tests {
             want_sequence,
             sequence_timeout,
         );
+
+        Ok((sequencer, publisher))
+    }
+
+    async fn test_it(
+        source: Vec<i64>,
+        target: Vec<(i64, Origin)>,
+        want_sequence: i64,
+        sequence_timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let (sequencer, publisher) = make_sequencer(want_sequence, sequence_timeout, target.len() as i64).await?;
         let result_stream = sequencer.into_stream();
         pin_mut!(result_stream);
 
