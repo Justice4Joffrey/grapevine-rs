@@ -26,12 +26,13 @@ pub struct Aggregator<S: StateSync> {
 impl<S: StateSync> Aggregator<S> {
     pub fn new(
         sequencer: MessageSequencer<S>,
+        sequencer_buf_size: Option<usize>,
     ) -> Self {
         let state = State::default();
         let (state_tx, state_rx) = watch::channel(state.clone());
-        let (sequencer_tx, mut sequencer_rx) = mpsc::unbounded_channel();
+        let (sequencer_tx, mut sequencer_rx) = mpsc::channel(sequencer_buf_size.unwrap_or(10_000));
 
-        // convert `Stream` to `unbounded_channel` because `Stream` doesn't have `try_recv`
+        // convert `Stream` to `channel` because `Stream` doesn't have `try_recv`
         tokio::spawn(async move {
             let sequencer = sequencer.into_stream();
             futures::pin_mut!(sequencer);
@@ -40,7 +41,7 @@ impl<S: StateSync> Aggregator<S> {
                     Ok(data) => {
                         // todo: handle non-deltas
                         if let Some(delta) = get_delta(data) {
-                            if sequencer_tx.send(delta).is_err() {
+                            if sequencer_tx.send(delta).await.is_err() {
                                 debug!("sequencer_rx was closed");
                                 break;
                             }
@@ -113,16 +114,16 @@ mod tests {
 
     use super::*;
 
-    fn prefix_sum(arr: Vec<i64>) -> Vec<i64> {
-        let mut ps = Vec::with_capacity(arr.len());
-        for v in arr {
-            if let Some(last) = ps.last() {
-                ps.push(last + v);
+    fn reverse_prefix_sum(ps: Vec<i64>) -> Vec<i64> {
+        let mut arr = Vec::with_capacity(ps.len());
+        for i in 0..ps.len() {
+            if i == 0 {
+                arr.push(ps[0]);
             } else {
-                ps.push(v);
+                arr.push(ps[i] - ps[i - 1]);
             }
         }
-        ps
+        arr
     }
 
     async fn publish_chunks(sizes: Vec<i64>, publisher: UdpSocket) {
@@ -166,7 +167,8 @@ mod tests {
             .then(|v| async move { v.read().await.sum })
             .collect::<Vec<_>>();
 
-        let result = timeout(Duration::from_secs(5), result_stream).await?;
+        let ps = timeout(Duration::from_secs(5), result_stream).await?;
+        let result = reverse_prefix_sum(ps);
 
         Ok(result)
     }
@@ -174,15 +176,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn chunks_are_valid() -> anyhow::Result<()> {
         // too big chunks can be divided (especially in multi-threaded runtime) which is decreasing test reproducibility
+        // for example sent chunks with sizes:
+        //   [1, 5, 10, 20, 100, 1000, 500, 200, 100, 100, 100, 50, 25, 10, 5, 1]
+        // can become something like:
+        //   [1, 5, 10, 20, 70, 30, 70, 63, 63, 65, 64, 66, 65, 63, 65, 61, ...]
         let sizes = vec![3, 5, 10, 3, 2, 2, 1, 1, 1];
 
         let (sequencer, publisher) = make_default_sequencer().await?;
-        let aggregator = Aggregator::<TestStateSync>::new(sequencer);
+        let aggregator = Aggregator::<TestStateSync>::new(sequencer, None);
 
         publish_chunks(sizes.clone(), publisher).await;
 
         let result = collect_result(aggregator, sizes.len()).await?;
-        assert_eq!(result, prefix_sum(sizes));
+        assert_eq!(result, sizes);
 
         Ok(())
     }
@@ -193,12 +199,12 @@ mod tests {
         let sizes = vec![1000, 500, 200, 100, 100, 100, 50, 25, 10, 5, 1, 1, 1];
 
         let (sequencer, publisher) = make_default_sequencer().await?;
-        let aggregator = Aggregator::<TestStateSync>::new(sequencer);
+        let aggregator = Aggregator::<TestStateSync>::new(sequencer, None);
 
         publish_chunks(sizes.clone(), publisher).await;
 
         let result = collect_result(aggregator, sizes.len()).await?;
-        assert_eq!(result, prefix_sum(sizes));
+        assert_eq!(result, sizes);
 
         Ok(())
     }
